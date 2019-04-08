@@ -10,11 +10,19 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 	//"golang.org/x/text/unicode/norm"
 )
 
-var TempDir = "./xl/worksheets/"
+var (
+	TempDir = "./xl/worksheets/"
+	rowPool = sync.Pool{
+		New: func() interface{} {
+			return &row{}
+		},
+	}
+)
 
 func CleanNonUtfAndControlChar(s string) string {
 	s = strings.Map(func(r rune) rune {
@@ -28,11 +36,14 @@ func CleanNonUtfAndControlChar(s string) string {
 	}, s)
 	return s
 }
-func ExportWorksheet(filename string, rows RowFetcher, SharedStrWriter *bufio.Writer, cellsCount *int) {
-	file, _ := os.Create(filename)
-	defer file.Close()
+func ExportWorksheet(filename string, rows RowFetcher, SharedStrWriter *bufio.Writer, cellsCount *int) error {
+	destFile, err := os.Create(filename)
+	if err != nil {
+		return fmt.Errorf("Failed to create file: %s, error: %s", filename, err.Error())
+	}
+	defer destFile.Close()
 
-	Writer := bufio.NewWriter(file)
+	Writer := bufio.NewWriter(destFile)
 
 	Writer.WriteString("<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?><worksheet xmlns=\"http://schemas.openxmlformats.org/spreadsheetml/2006/main\" xmlns:r=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships\" xmlns:mc=\"http://schemas.openxmlformats.org/markup-compatibility/2006\" mc:Ignorable=\"x14ac\" xmlns:x14ac=\"http://schemas.microsoft.com/office/spreadsheetml/2009/9/ac\">")
 	Writer.WriteString("<sheetViews><sheetView tabSelected=\"1\" workbookViewId=\"0\"><selection activeCell=\"A1\" sqref=\"A1\"/></sheetView></sheetViews>")
@@ -40,82 +51,52 @@ func ExportWorksheet(filename string, rows RowFetcher, SharedStrWriter *bufio.Wr
 	Writer.WriteString("<sheetData>")
 
 	rowCount := 1
-	//uniqueString := map[string]int{}
-	//sortedUsedStr := []string{}
-	//cellsCount := 0
+
 	for {
 		raw_row := rows.NextRow()
 		if raw_row == nil {
 			break
 		}
-		rr := row{}
+
+		rr := rowPool.Get().(row)
 		rr.R = rowCount
+		rr.C = []XlsxC{}
+
 		for idx, val := range raw_row {
 			colName := colCountToAlphaabet(idx)
-			newCol := XlsxC{}
-			newCol.T = "s"
-			newCol.R = fmt.Sprintf("%s%d", colName, rowCount)
-			// idxStr, ok := uniqueString[val]
-			// if ok {
-			// 	newCol.V = strconv.Itoa(idxStr)
-			// } else {
-			// 	uniqueString[val] = len(uniqueString)
-			// 	newCol.V = strconv.Itoa(uniqueString[val])
-			// 	sortedUsedStr = append(sortedUsedStr, val)
-			// }
-			newCol.V = strconv.Itoa(*cellsCount)
+			newCol := XlsxC{
+				T: "s",
+				R: fmt.Sprintf("%s%d", colName, rowCount),
+				V: strconv.Itoa(*cellsCount),
+			}
 			*cellsCount++
 			rr.C = append(rr.C, newCol)
-			fmt.Println(val, html.EscapeString(CleanNonUtfAndControlChar(val)))
 			SharedStrWriter.WriteString(fmt.Sprintf("<si><t>%s</t></si>", html.EscapeString(CleanNonUtfAndControlChar(val))))
 		}
 		rr.Spans = "1:10"
 		rr.Descent = "0.25"
-		bb, e := xml.Marshal(rr)
-		if e != nil {
-			fmt.Println("Encoder error", e.Error())
-			fmt.Println(rr)
-			os.Exit(1)
+		xmlBody, err := xml.Marshal(rr)
+		rowPool.Put(rr)
+		if err != nil {
+			return err
 		}
-		//fmt.Println(string(bb))
-		pp, e := Writer.Write(bb)
-		if e != nil {
-			fmt.Println("Writer error", e.Error())
-			fmt.Println(rr)
-			os.Exit(1)
+		_, err = Writer.Write(xmlBody)
+		if err != nil {
+			return err
 		}
-		if pp != len(bb) {
-			fmt.Println("Writer error2")
-		}
+
 		if rowCount%1000 == 0 {
 			SharedStrWriter.Flush()
 			Writer.Flush()
 		}
 		rowCount++
-
 	}
 	Writer.WriteString("</sheetData>")
 	Writer.WriteString("<pageMargins left=\"0.7\" right=\"0.7\" top=\"0.75\" bottom=\"0.75\" header=\"0.3\" footer=\"0.3\"/>")
 	Writer.WriteString("</worksheet>")
-	Writer.Flush()
-
-	//write shared strings
-	//sharedString := xlsxSST{}
-	//sharedString.Count = len(sortedUsedStr)
-	//sharedString.UniqueCount = len(sortedUsedStr)
-	// for _, val := range sortedUsedStr {
-	// 	ss := xlsxSI{}
-	// 	ss.T = val
-	// 	sharedString.SI = append(sharedString.SI, ss)
-	// }
-
-	// encoder := xml.NewEncoder(shaStr)
-	// e := encoder.Encode(sharedString)
-	// if e != nil {
-	// 	fmt.Println(e.Error())
-	// }
-
+	return Writer.Flush()
 }
+
 func colCountToAlphaabet(idx int) string {
 	var colName string
 	if idx >= 26 {
@@ -127,16 +108,27 @@ func colCountToAlphaabet(idx int) string {
 	}
 	return strings.ToUpper(colName)
 }
-func Export(filename string, fetcher RowFetcher) {
+func Export(filename string, fetcher RowFetcher) error {
 	now := time.Now()
 	sheetName := now.Format("20060102150405") //filename should be (pseudo)random
-	shaStr, _ := os.Create(sheetName + ".ss")
-	//defer shaStr.Close()
+	shaStr, err := os.Create(sheetName + ".ss")
+	if err != nil {
+		return err
+	}
+	defer func() {
+		shaStr.Close()
+		os.Remove("./" + sheetName + ".ss")
+	}()
+
 	SharedStrWriter := bufio.NewWriter(shaStr)
 	SharedStrWriter.WriteString("<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>")
 	SharedStrWriter.WriteString("<sst xmlns=\"http://schemas.openxmlformats.org/spreadsheetml/2006/main\" count=\"0\" uniqueCount=\"0\">")
 	cellCount := 0
-	ExportWorksheet(sheetName, fetcher, SharedStrWriter, &cellCount)
+	err = ExportWorksheet(sheetName, fetcher, SharedStrWriter, &cellCount)
+	if err != nil {
+		return err
+	}
+
 	SharedStrWriter.WriteString("</sst>")
 	SharedStrWriter.Flush()
 	outputFile := filename
@@ -151,24 +143,27 @@ func Export(filename string, fetcher RowFetcher) {
 	file["xl/workbook.xml"] = DummyWorkbookXml()
 	file["xl/sharedStrings.xml"], _ = os.Open(sheetName + ".ss")
 	file["[Content_Types].xml"] = DummyContentTypes()
-	of, _ := os.Create(outputFile)
+	of, err := os.Create(outputFile)
+	if err != nil {
+		return fmt.Errorf("Failed to create file: %s, error: %s", outputFile, err.Error())
+	}
 	defer of.Close()
 	zipWriter := zip.NewWriter(of)
 	for k, v := range file {
-		fWriter, _ := zipWriter.Create(k)
-		io.Copy(fWriter, v)
-
+		fWriter, err := zipWriter.Create(k)
+		if err != nil {
+			return err
+		}
+		if _, err = io.Copy(fWriter, v); err != nil {
+			return err
+		}
 	}
-	zipWriter.Close()
+	defer zipWriter.Close()
 	(file["xl/sharedStrings.xml"].(*os.File)).Close()
 	(file["xl/worksheets/sheet1.xml"].(*os.File)).Close()
-	e := os.Remove("./" + sheetName)
-	if e != nil {
-		fmt.Println(e.Error())
+	err = os.Remove("./" + sheetName)
+	if err != nil {
+		err = fmt.Errorf("Failed to remove file: %s, error: %s", sheetName, err.Error())
 	}
-	shaStr.Close()
-	e = os.Remove("./" + sheetName + ".ss")
-	if e != nil {
-		fmt.Println(e.Error())
-	}
+	return err
 }
