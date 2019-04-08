@@ -58,7 +58,7 @@ func ExportWorksheet(filename string, rows RowFetcher, SharedStrWriter *bufio.Wr
 			break
 		}
 
-		rr := rowPool.Get().(row)
+		rr := rowPool.Get().(*row)
 		rr.R = rowCount
 		rr.C = []XlsxC{}
 
